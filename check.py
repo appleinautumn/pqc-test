@@ -2,16 +2,15 @@
 import argparse
 import ipaddress
 import json
+import os
 import re
 import subprocess
+import tempfile
+from pathlib import Path
 from urllib.parse import urlsplit
 
-# Standard NIST PQC and draft hybrid groups
-PQC_GROUPS = {
-    "X25519MLKEM768",      # NIST FIPS 203 Standard
-    "SecP256r1MLKEM768",   # FIPS-compliant hybrid
-    "X25519Kyber768Draft00"# Legacy pre-standard draft
-}
+TARGET_GROUP = "X25519MLKEM768"
+GO_PROBE = Path(__file__).with_name("pqc_probe.go")
 
 
 class TargetError(ValueError):
@@ -91,25 +90,6 @@ def parse_target(target: str, explicit_port: int | None = None) -> tuple[str, in
     return normalize_host(host), validate_port(port)
 
 
-def format_connect_target(host: str, port: int) -> str:
-    """Format a host and port for OpenSSL's -connect argument."""
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return f"{host}:{port}"
-    if address.version == 6:
-        return f"[{host}]:{port}"
-    return f"{host}:{port}"
-
-
-def is_ip_address(host: str) -> bool:
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return False
-
-
 def positive_timeout(value: str) -> float:
     try:
         timeout = float(value)
@@ -120,78 +100,128 @@ def positive_timeout(value: str) -> float:
     return timeout
 
 
+def run_go_probe(host: str, port: int, timeout: float, group: str) -> dict:
+    """Run the Go TLS backend and return its structured probe result."""
+    command = [
+        "go",
+        "run",
+        str(GO_PROBE),
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--timeout",
+        str(timeout),
+        "--group",
+        group,
+    ]
+    environment = os.environ.copy()
+    environment.setdefault("GOCACHE", str(Path(tempfile.gettempdir()) / "pqc-go-cache"))
+    try:
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 30,
+            check=False,
+            env=environment,
+        )
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "error_kind": "local_backend_unavailable",
+            "error": "Go is not installed or is not available in PATH.",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "error_kind": "local_backend_timeout",
+            "error": "The Go probe did not finish in time.",
+        }
+
+    if process.returncode != 0:
+        error = process.stderr.strip() or "The Go probe exited without a result."
+        return {
+            "success": False,
+            "error_kind": "local_backend_error",
+            "error": error,
+        }
+
+    try:
+        result = json.loads(process.stdout)
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "error_kind": "local_backend_error",
+            "error": "The Go probe returned invalid JSON.",
+        }
+    if not isinstance(result, dict):
+        return {
+            "success": False,
+            "error_kind": "local_backend_error",
+            "error": "The Go probe returned an unexpected result.",
+        }
+    return result
+
+
 def check_pqc_readiness(host: str, port: int = 443, timeout: float = 10) -> dict:
-    """
-    Probes a remote server by offering hybrid PQC groups in TLS 1.3 ClientHello.
-    Requires OpenSSL 3.5+ or OpenSSL built with oqs-provider.
-    """
+    """Test whether a TLS 1.3 endpoint accepts X25519MLKEM768."""
     host = normalize_host(host)
     port = validate_port(port)
     if timeout <= 0:
         raise TargetError("timeout must be greater than zero")
 
-    cmd = [
-        "openssl", "s_client",
-        "-connect", format_connect_target(host, port),
-    ]
-    if not is_ip_address(host):
-        cmd.extend(["-servername", host])
-    cmd.extend([
-        "-tls1_3",
-        "-groups", "X25519MLKEM768:SecP256r1MLKEM768:X25519:P-256"
-    ])
+    pqc_probe = run_go_probe(host, port, timeout, "x25519mlkem768")
+    classical_probe = None
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=b"",
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-        output = proc.stdout.decode("utf-8", errors="ignore")
-    except FileNotFoundError:
-        return {"error": "OpenSSL binary not found in system PATH."}
-    except subprocess.TimeoutExpired:
-        return {"error": f"Connection timed out when probing {host}:{port}."}
-
-    # Extract TLS Protocol
-    protocol_match = re.search(r"Protocol\s*:\s*(TLSv[\d\.]+)", output)
-    protocol = protocol_match.group(1) if protocol_match else "Unknown"
-
-    # Extract Cipher Suite
-    cipher_match = re.search(r"Cipher\s*:\s*([A-Za-z0-9_\-]+)", output)
-    cipher = cipher_match.group(1) if cipher_match else "Unknown"
-
-    # Extract Negotiated TLS 1.3 Named Group (Key Exchange)
-    group_match = re.search(r"Negotiated TLS1\.3 group\s*:\s*([A-Za-z0-9_\-]+)", output)
-    group = group_match.group(1) if group_match else None
-
-    # Check PQC Status
-    if group and any(pqc in group for pqc in PQC_GROUPS):
-        pqc_status = "PQC_SECURE_HYBRID"
-        is_pqc = True
-        status_label = "aman"
-    elif group:
-        pqc_status = "CLASSICAL_ONLY"
-        is_pqc = False
-        status_label = "belum aman (vulnerable to HNDL)"
+    if pqc_probe.get("success") and pqc_probe.get("negotiated_group") == TARGET_GROUP:
+        status = "X25519MLKEM768_NEGOTIATED"
+        supports_group = True
+        evaluation = "The endpoint negotiated hybrid X25519MLKEM768 key exchange."
+    elif pqc_probe.get("error_kind") == "tls_handshake_failed":
+        classical_probe = run_go_probe(host, port, timeout, "classical")
+        if classical_probe.get("success"):
+            status = "X25519MLKEM768_NOT_SUPPORTED"
+            supports_group = False
+            evaluation = "TLS 1.3 works, but the endpoint did not accept X25519MLKEM768."
+        else:
+            status = "INCONCLUSIVE"
+            supports_group = None
+            evaluation = "Neither the PQC probe nor the classical control completed a TLS handshake."
+    elif pqc_probe.get("error_kind") == "network_error":
+        status = "NETWORK_ERROR"
+        supports_group = None
+        evaluation = "The endpoint could not be reached, so PQC support is unknown."
     else:
-        pqc_status = "HANDSHAKE_FAILED_OR_LEGACY"
-        is_pqc = False
-        status_label = "incompatible"
+        status = "LOCAL_PROBE_ERROR"
+        supports_group = None
+        evaluation = "The local Go TLS probe could not perform the test."
 
     return {
         "target": host,
         "port": port,
-        "pqc_status": pqc_status,
-        "is_quantum_resistant": is_pqc,
-        "evaluation": status_label,
+        "pqc_status": status,
+        "supports_x25519_mlkem768": supports_group,
+        "is_quantum_resistant": supports_group,
+        "evaluation": evaluation,
         "details": {
-            "protocol": protocol,
-            "cipher_suite": cipher,
-            "negotiated_group": group or "None negotiated"
-        }
+            "protocol": pqc_probe.get("tls_version", "Unknown"),
+            "cipher_suite": pqc_probe.get("cipher_suite", "Unknown"),
+            "negotiated_group": pqc_probe.get("negotiated_group", "None negotiated"),
+            "certificate_verified": pqc_probe.get("certificate_verified"),
+            "backend": pqc_probe.get("backend", "go-crypto-tls"),
+            "backend_version": pqc_probe.get("backend_version", "Unknown"),
+            "error": pqc_probe.get("error"),
+        },
+        "probes": {
+            "x25519_mlkem768": pqc_probe,
+            "classical_control": classical_probe,
+        },
+        "limitations": [
+            "This checks TLS key exchange, not post-quantum certificate authentication.",
+            "Certificate validity is not evaluated by this capability probe.",
+            "Other IP addresses or CDN regions may negotiate differently.",
+        ],
     }
 
 def build_argument_parser() -> argparse.ArgumentParser:
