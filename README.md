@@ -10,11 +10,13 @@ The primary probe offers **only** `X25519MLKEM768` in a TLS 1.3 handshake. A suc
 
 If the PQC handshake fails, the checker performs a control handshake using the classical `X25519` and `P-256` groups. This helps distinguish an endpoint that does not accept `X25519MLKEM768` from an endpoint with a broader TLS or connectivity problem.
 
+For a successful handshake, the checker inventories each certificate presented by the server and classifies its public-key and signature algorithms as `classical`, `post_quantum`, `hybrid`, or `unknown`. It also derives a conservative classification for the presented chain.
+
 ## What it does not check
 
 This tool does not prove that an entire website is quantum-safe. In particular, it does not evaluate:
 
-- Post-quantum certificate signatures
+- Algorithms used by a trust anchor or other certificate not presented by the server
 - Certificate validity or hostname verification unless `--verify-certificate` is used
 - Application-layer encryption
 - Every IP address, CDN edge, or geographic region serving the hostname
@@ -83,7 +85,23 @@ The default target is `cloudflare.com` when no target is supplied.
   "pqc_status": "X25519MLKEM768_NEGOTIATED",
   "supports_x25519_mlkem768": true,
   "key_establishment_security": "hybrid_post_quantum",
-  "certificate_security": "not_evaluated",
+  "certificate_security": "classical",
+  "certificate_analysis": {
+    "status": "classified",
+    "presented_chain_classification": "classical",
+    "certificates": [
+      {
+        "index": 0,
+        "role": "leaf",
+        "subject": "CN=cloudflare.com",
+        "issuer": "CN=Example CA",
+        "public_key_algorithm": "ECDSA",
+        "public_key_classification": "classical",
+        "signature_algorithm": "ECDSA-SHA256",
+        "signature_classification": "classical"
+      }
+    ]
+  },
   "certificate_verification": {
     "requested": false,
     "status": "not_requested",
@@ -113,7 +131,17 @@ The default target is `cloudflare.com` when no target is supplied.
 | `target_hybrid_group_not_supported` | Classical TLS 1.3 succeeded after the endpoint rejected the `X25519MLKEM768`-only probe. This does not rule out support for other post-quantum groups. |
 | `unknown` | The endpoint's key-establishment capability could not be established. |
 
-`certificate_security` is currently always `not_evaluated` because certificate verification does not determine whether the certificate's authentication algorithm is post-quantum secure.
+`certificate_security` summarizes the public-key and signature algorithm classifications across the certificates presented by the server:
+
+| Value | Meaning |
+| --- | --- |
+| `classical` | Every observed public-key and signature algorithm is classical. |
+| `post_quantum` | Every observed public-key and signature algorithm is post-quantum. |
+| `hybrid` | Every observed algorithm is explicitly hybrid. |
+| `mixed` | The presented chain contains more than one recognized classification. |
+| `unknown` | No certificate information was available or at least one algorithm could not be classified safely. |
+
+`certificate_analysis.certificates` contains the per-certificate public-key and signature classifications. The aggregate applies only to the server-presented chain; TLS servers commonly omit their root certificate. Classification is independent of certificate verification and does not establish trust or validity.
 
 `certificate_verification.status` is one of:
 
@@ -168,7 +196,7 @@ flowchart TD
     E -->|Control fails| G[Report inconclusive]
 ```
 
-The Python entry point is `check.py`. It invokes `pqc_probe.go` with `go run`. The Go helper performs the TLS handshake and returns structured JSON containing the negotiated TLS version, cipher suite, and curve ID.
+The Python entry point is `check.py`. It invokes `pqc_probe.go` with `go run`. The Go helper performs the TLS handshake and returns structured JSON containing the negotiated TLS version, cipher suite, curve ID, and algorithms used by the server-presented certificates.
 
 The first execution may take slightly longer while Go compiles and caches the helper.
 
@@ -180,16 +208,16 @@ Run the Python unit tests:
 python3 -m unittest -v test_check.py
 ```
 
-Compile-check the Go probe:
+Run the Go tests and compile-check the probe:
 
 ```bash
-go test pqc_probe.go
+go test
 ```
 
 Run Go static analysis:
 
 ```bash
-go vet pqc_probe.go
+go vet ./...
 ```
 
 The Python tests use mocked probe results and do not require network access.
@@ -197,11 +225,17 @@ The Python tests use mocked probe results and do not require network access.
 ## Files
 
 - `check.py` — CLI, target validation, probe orchestration, and result classification
-- `pqc_probe.go` — TLS 1.3 probe using Go's `crypto/tls`
+- `go.mod` — dependency-free Go module definition for tests and tooling
+- `pqc_probe.go` — TLS 1.3 probe and certificate algorithm inventory using Go's standard library
+- `pqc_probe_test.go` — certificate algorithm-classification unit tests
 - `test_check.py` — target-handling and result-classification unit tests
 
 ## Security considerations
 
-The key-establishment probes intentionally disable certificate verification because they test capability rather than endpoint identity. With `--verify-certificate`, the checker performs a separate handshake using Go's standard certificate-chain and hostname verification. Certificate failure is reported independently and does not overwrite the key-establishment result.
+The key-establishment probes intentionally disable certificate verification because they test capability rather than endpoint identity. They still inspect the algorithms in certificates presented during a successful handshake. With `--verify-certificate`, the checker performs a separate handshake using Go's standard certificate-chain and hostname verification. Certificate failure is reported independently and does not overwrite the key-establishment result.
+
+Algorithm classification is conservative. Recognized RSA, DSA, ECDSA, and Ed25519 algorithms are classical; recognized ML-DSA, SLH-DSA, Dilithium, Falcon, and SPHINCS+ names are post-quantum; composite or combined classical/PQ names are hybrid. Unrecognized algorithms are reported as `unknown` rather than assumed secure.
+
+Classification is limited to certificate algorithms that the installed Go `crypto/x509` implementation can parse. If an endpoint uses a PQ certificate unsupported by that Go version, the TLS handshake may fail and certificate classification will be unavailable rather than falsely reported as post-quantum.
 
 If this checker is exposed through a web application or API, restrict permitted targets. Allowing arbitrary hostnames, IP addresses, and ports can turn the service into an SSRF or internal-network scanning mechanism.

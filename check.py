@@ -172,6 +172,42 @@ def run_go_probe(
     return result
 
 
+def summarize_certificate_chain(certificates: object) -> dict:
+    """Summarize algorithm classifications for the server-presented chain."""
+    if not isinstance(certificates, list) or not certificates:
+        return {
+            "status": "unavailable",
+            "presented_chain_classification": "unknown",
+            "certificates": [],
+        }
+
+    classifications = []
+    for certificate in certificates:
+        if not isinstance(certificate, dict):
+            classifications.append("unknown")
+            continue
+        classifications.extend(
+            [
+                certificate.get("public_key_classification", "unknown"),
+                certificate.get("signature_classification", "unknown"),
+            ]
+        )
+
+    known_classifications = {"classical", "post_quantum", "hybrid"}
+    if any(item not in known_classifications for item in classifications):
+        chain_classification = "unknown"
+    elif len(set(classifications)) == 1:
+        chain_classification = classifications[0]
+    else:
+        chain_classification = "mixed"
+
+    return {
+        "status": "classified",
+        "presented_chain_classification": chain_classification,
+        "certificates": certificates,
+    }
+
+
 def check_pqc_readiness(
     host: str,
     port: int = 443,
@@ -214,6 +250,11 @@ def check_pqc_readiness(
         supports_group = None
         key_establishment_security = "unknown"
         evaluation = "The local Go TLS probe could not perform the test."
+
+    certificate_probe = pqc_probe if pqc_probe.get("success") else classical_probe
+    certificate_analysis = summarize_certificate_chain(
+        certificate_probe.get("certificates") if certificate_probe else None
+    )
 
     verification_probe = None
     if not verify_certificate:
@@ -262,7 +303,8 @@ def check_pqc_readiness(
         "pqc_status": status,
         "supports_x25519_mlkem768": supports_group,
         "key_establishment_security": key_establishment_security,
-        "certificate_security": "not_evaluated",
+        "certificate_security": certificate_analysis["presented_chain_classification"],
+        "certificate_analysis": certificate_analysis,
         "certificate_verification": certificate_verification,
         "is_quantum_resistant": supports_group,
         "evaluation": evaluation,
@@ -281,8 +323,8 @@ def check_pqc_readiness(
             "certificate_verification": verification_probe,
         },
         "limitations": [
-            "This checks TLS key establishment, not post-quantum certificate authentication.",
-            "Certificate validity is not evaluated by this capability probe.",
+            "Certificate algorithm classification covers only certificates presented by the server.",
+            "Algorithm classification does not establish certificate validity; use --verify-certificate.",
             "is_quantum_resistant is deprecated; use the dimension-specific result fields.",
             "Other IP addresses or CDN regions may negotiate differently.",
         ],
