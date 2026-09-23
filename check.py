@@ -177,24 +177,29 @@ def check_pqc_readiness(host: str, port: int = 443, timeout: float = 10) -> dict
     if pqc_probe.get("success") and pqc_probe.get("negotiated_group") == TARGET_GROUP:
         status = "X25519MLKEM768_NEGOTIATED"
         supports_group = True
+        key_establishment_security = "hybrid_post_quantum"
         evaluation = "The endpoint negotiated hybrid X25519MLKEM768 key exchange."
     elif pqc_probe.get("error_kind") == "tls_handshake_failed":
         classical_probe = run_go_probe(host, port, timeout, "classical")
         if classical_probe.get("success"):
             status = "X25519MLKEM768_NOT_SUPPORTED"
             supports_group = False
+            key_establishment_security = "target_hybrid_group_not_supported"
             evaluation = "TLS 1.3 works, but the endpoint did not accept X25519MLKEM768."
         else:
             status = "INCONCLUSIVE"
             supports_group = None
-            evaluation = "Neither the PQC probe nor the classical control completed a TLS handshake."
+            key_establishment_security = "unknown"
+            evaluation = "Neither the hybrid-group probe nor the classical control completed a TLS handshake."
     elif pqc_probe.get("error_kind") == "network_error":
         status = "NETWORK_ERROR"
         supports_group = None
-        evaluation = "The endpoint could not be reached, so PQC support is unknown."
+        key_establishment_security = "unknown"
+        evaluation = "The endpoint could not be reached, so X25519MLKEM768 support is unknown."
     else:
         status = "LOCAL_PROBE_ERROR"
         supports_group = None
+        key_establishment_security = "unknown"
         evaluation = "The local Go TLS probe could not perform the test."
 
     return {
@@ -202,6 +207,8 @@ def check_pqc_readiness(host: str, port: int = 443, timeout: float = 10) -> dict
         "port": port,
         "pqc_status": status,
         "supports_x25519_mlkem768": supports_group,
+        "key_establishment_security": key_establishment_security,
+        "certificate_security": "not_evaluated",
         "is_quantum_resistant": supports_group,
         "evaluation": evaluation,
         "details": {
@@ -218,8 +225,9 @@ def check_pqc_readiness(host: str, port: int = 443, timeout: float = 10) -> dict
             "classical_control": classical_probe,
         },
         "limitations": [
-            "This checks TLS key exchange, not post-quantum certificate authentication.",
+            "This checks TLS key establishment, not post-quantum certificate authentication.",
             "Certificate validity is not evaluated by this capability probe.",
+            "is_quantum_resistant is deprecated; use the dimension-specific result fields.",
             "Other IP addresses or CDN regions may negotiate differently.",
         ],
     }

@@ -74,6 +74,8 @@ The default target is `cloudflare.com` when no target is supplied.
   "port": 443,
   "pqc_status": "X25519MLKEM768_NEGOTIATED",
   "supports_x25519_mlkem768": true,
+  "key_establishment_security": "hybrid_post_quantum",
+  "certificate_security": "not_evaluated",
   "is_quantum_resistant": true,
   "evaluation": "The endpoint negotiated hybrid X25519MLKEM768 key exchange.",
   "details": {
@@ -88,7 +90,17 @@ The default target is `cloudflare.com` when no target is supplied.
 }
 ```
 
-`is_quantum_resistant` refers only to the observed hybrid key exchange. It must not be interpreted as a claim that every part of the website or its authentication is post-quantum secure.
+`key_establishment_security` describes only the observed TLS key-establishment result. Its possible values are:
+
+| Value | Meaning |
+| --- | --- |
+| `hybrid_post_quantum` | The endpoint negotiated exactly `X25519MLKEM768`. |
+| `target_hybrid_group_not_supported` | Classical TLS 1.3 succeeded after the endpoint rejected the `X25519MLKEM768`-only probe. This does not rule out support for other post-quantum groups. |
+| `unknown` | The endpoint's key-establishment capability could not be established. |
+
+`certificate_security` is currently always `not_evaluated` because this capability probe neither verifies certificates nor evaluates whether certificate authentication is post-quantum secure.
+
+`is_quantum_resistant` is deprecated and retained temporarily for compatibility. It mirrors `supports_x25519_mlkem768`; new integrations should use `supports_x25519_mlkem768`, `key_establishment_security`, and `certificate_security`. No field should be interpreted as a claim that every part of the website is post-quantum secure.
 
 ## Result statuses
 
