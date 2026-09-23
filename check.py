@@ -100,7 +100,13 @@ def positive_timeout(value: str) -> float:
     return timeout
 
 
-def run_go_probe(host: str, port: int, timeout: float, group: str) -> dict:
+def run_go_probe(
+    host: str,
+    port: int,
+    timeout: float,
+    group: str,
+    verify_certificate: bool = False,
+) -> dict:
     """Run the Go TLS backend and return its structured probe result."""
     command = [
         "go",
@@ -115,6 +121,8 @@ def run_go_probe(host: str, port: int, timeout: float, group: str) -> dict:
         "--group",
         group,
     ]
+    if verify_certificate:
+        command.append("--verify-certificate")
     environment = os.environ.copy()
     environment.setdefault("GOCACHE", str(Path(tempfile.gettempdir()) / "pqc-go-cache"))
     try:
@@ -164,8 +172,13 @@ def run_go_probe(host: str, port: int, timeout: float, group: str) -> dict:
     return result
 
 
-def check_pqc_readiness(host: str, port: int = 443, timeout: float = 10) -> dict:
-    """Test whether a TLS 1.3 endpoint accepts X25519MLKEM768."""
+def check_pqc_readiness(
+    host: str,
+    port: int = 443,
+    timeout: float = 10,
+    verify_certificate: bool = False,
+) -> dict:
+    """Test X25519MLKEM768 support and optionally verify the certificate."""
     host = normalize_host(host)
     port = validate_port(port)
     if timeout <= 0:
@@ -202,6 +215,47 @@ def check_pqc_readiness(host: str, port: int = 443, timeout: float = 10) -> dict
         key_establishment_security = "unknown"
         evaluation = "The local Go TLS probe could not perform the test."
 
+    verification_probe = None
+    if not verify_certificate:
+        certificate_verification = {
+            "requested": False,
+            "status": "not_requested",
+            "verified": None,
+            "hostname_verified": None,
+            "error": None,
+        }
+    elif supports_group is None:
+        certificate_verification = {
+            "requested": True,
+            "status": "unavailable",
+            "verified": None,
+            "hostname_verified": None,
+            "error": "No successful TLS handshake was available for certificate verification.",
+        }
+    else:
+        verification_group = "x25519mlkem768" if supports_group else "classical"
+        verification_probe = run_go_probe(
+            host,
+            port,
+            timeout,
+            verification_group,
+            verify_certificate=True,
+        )
+        certificate_verified = verification_probe.get("certificate_verified")
+        if verification_probe.get("success") and certificate_verified is True:
+            verification_status = "verified"
+        elif verification_probe.get("error_kind") == "certificate_verification_failed":
+            verification_status = "failed"
+        else:
+            verification_status = "unavailable"
+        certificate_verification = {
+            "requested": True,
+            "status": verification_status,
+            "verified": certificate_verified,
+            "hostname_verified": verification_probe.get("hostname_verified"),
+            "error": verification_probe.get("error"),
+        }
+
     return {
         "target": host,
         "port": port,
@@ -209,13 +263,14 @@ def check_pqc_readiness(host: str, port: int = 443, timeout: float = 10) -> dict
         "supports_x25519_mlkem768": supports_group,
         "key_establishment_security": key_establishment_security,
         "certificate_security": "not_evaluated",
+        "certificate_verification": certificate_verification,
         "is_quantum_resistant": supports_group,
         "evaluation": evaluation,
         "details": {
             "protocol": pqc_probe.get("tls_version", "Unknown"),
             "cipher_suite": pqc_probe.get("cipher_suite", "Unknown"),
             "negotiated_group": pqc_probe.get("negotiated_group", "None negotiated"),
-            "certificate_verified": pqc_probe.get("certificate_verified"),
+            "certificate_verified": certificate_verification["verified"],
             "backend": pqc_probe.get("backend", "go-crypto-tls"),
             "backend_version": pqc_probe.get("backend_version", "Unknown"),
             "error": pqc_probe.get("error"),
@@ -223,6 +278,7 @@ def check_pqc_readiness(host: str, port: int = 443, timeout: float = 10) -> dict
         "probes": {
             "x25519_mlkem768": pqc_probe,
             "classical_control": classical_probe,
+            "certificate_verification": verification_probe,
         },
         "limitations": [
             "This checks TLS key establishment, not post-quantum certificate authentication.",
@@ -253,6 +309,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="connection timeout in seconds (default: 10)",
     )
+    parser.add_argument(
+        "--verify-certificate",
+        action="store_true",
+        help="verify the certificate chain and target hostname in a separate handshake",
+    )
     return parser
 
 
@@ -261,7 +322,12 @@ def main() -> None:
     args = parser.parse_args()
     try:
         host, port = parse_target(args.target, args.port)
-        result = check_pqc_readiness(host, port, args.timeout)
+        result = check_pqc_readiness(
+            host,
+            port,
+            args.timeout,
+            verify_certificate=args.verify_certificate,
+        )
     except TargetError as exc:
         parser.error(str(exc))
     print(json.dumps(result, indent=2))

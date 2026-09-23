@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -23,6 +24,7 @@ type probeResult struct {
 	Backend          string `json:"backend"`
 	BackendVersion   string `json:"backend_version"`
 	CertificateValid *bool  `json:"certificate_verified"`
+	HostnameValid    *bool  `json:"hostname_verified"`
 }
 
 func curveName(curve tls.CurveID) string {
@@ -66,7 +68,7 @@ func resultWithError(kind string, err error) probeResult {
 	}
 }
 
-func probe(host string, port int, timeout time.Duration, curves []tls.CurveID) probeResult {
+func probe(host string, port int, timeout time.Duration, curves []tls.CurveID, verifyCertificate bool) probeResult {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -78,7 +80,7 @@ func probe(host string, port int, timeout time.Duration, curves []tls.CurveID) p
 	defer rawConn.Close()
 
 	serverName := ""
-	if net.ParseIP(host) == nil {
+	if verifyCertificate || net.ParseIP(host) == nil {
 		serverName = host
 	}
 
@@ -87,15 +89,33 @@ func probe(host string, port int, timeout time.Duration, curves []tls.CurveID) p
 		MaxVersion:         tls.VersionTLS13,
 		CurvePreferences:   curves,
 		ServerName:         serverName,
-		InsecureSkipVerify: true, // Capability probe only; certificate validity is not evaluated.
+		InsecureSkipVerify: !verifyCertificate,
 	})
 	defer conn.Close()
 
 	if err := conn.HandshakeContext(ctx); err != nil {
-		return resultWithError("tls_handshake_failed", err)
+		result := resultWithError("tls_handshake_failed", err)
+		var verificationError *tls.CertificateVerificationError
+		if verifyCertificate && errors.As(err, &verificationError) {
+			certificateValid := false
+			result.ErrorKind = "certificate_verification_failed"
+			result.CertificateValid = &certificateValid
+			if len(verificationError.UnverifiedCertificates) > 0 {
+				hostnameValid := verificationError.UnverifiedCertificates[0].VerifyHostname(host) == nil
+				result.HostnameValid = &hostnameValid
+			}
+		}
+		return result
 	}
 
 	state := conn.ConnectionState()
+	var certificateValid *bool
+	var hostnameValid *bool
+	if verifyCertificate {
+		verified := true
+		certificateValid = &verified
+		hostnameValid = &verified
+	}
 	return probeResult{
 		Success:          true,
 		TLSVersion:       tlsVersionName(state.Version),
@@ -103,7 +123,8 @@ func probe(host string, port int, timeout time.Duration, curves []tls.CurveID) p
 		NegotiatedGroup:  curveName(state.CurveID),
 		Backend:          "go-crypto-tls",
 		BackendVersion:   runtime.Version(),
-		CertificateValid: nil,
+		CertificateValid: certificateValid,
+		HostnameValid:    hostnameValid,
 	}
 }
 
@@ -112,6 +133,7 @@ func main() {
 	port := flag.Int("port", 443, "target TLS port")
 	timeoutSeconds := flag.Float64("timeout", 10, "network timeout in seconds")
 	group := flag.String("group", "x25519mlkem768", "group set: x25519mlkem768 or classical")
+	verifyCertificate := flag.Bool("verify-certificate", false, "verify the certificate chain and target hostname")
 	flag.Parse()
 
 	if *host == "" || *port < 1 || *port > 65535 || *timeoutSeconds <= 0 {
@@ -130,7 +152,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	result := probe(*host, *port, time.Duration(*timeoutSeconds*float64(time.Second)), curves)
+	result := probe(*host, *port, time.Duration(*timeoutSeconds*float64(time.Second)), curves, *verifyCertificate)
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

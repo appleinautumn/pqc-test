@@ -15,7 +15,7 @@ If the PQC handshake fails, the checker performs a control handshake using the c
 This tool does not prove that an entire website is quantum-safe. In particular, it does not evaluate:
 
 - Post-quantum certificate signatures
-- Certificate validity or hostname verification
+- Certificate validity or hostname verification unless `--verify-certificate` is used
 - Application-layer encryption
 - Every IP address, CDN edge, or geographic region serving the hostname
 - TLS behavior of other ports or protocols
@@ -58,6 +58,14 @@ python3 check.py example.com --port 8443
 python3 check.py example.com --timeout 5
 ```
 
+Optionally verify the certificate chain and target hostname in a separate TLS handshake:
+
+```bash
+python3 check.py example.com --verify-certificate
+```
+
+Certificate verification is separate from the key-establishment probe, so an invalid certificate does not hide an otherwise successful `X25519MLKEM768` negotiation.
+
 Display CLI help:
 
 ```bash
@@ -76,6 +84,13 @@ The default target is `cloudflare.com` when no target is supplied.
   "supports_x25519_mlkem768": true,
   "key_establishment_security": "hybrid_post_quantum",
   "certificate_security": "not_evaluated",
+  "certificate_verification": {
+    "requested": false,
+    "status": "not_requested",
+    "verified": null,
+    "hostname_verified": null,
+    "error": null
+  },
   "is_quantum_resistant": true,
   "evaluation": "The endpoint negotiated hybrid X25519MLKEM768 key exchange.",
   "details": {
@@ -98,7 +113,18 @@ The default target is `cloudflare.com` when no target is supplied.
 | `target_hybrid_group_not_supported` | Classical TLS 1.3 succeeded after the endpoint rejected the `X25519MLKEM768`-only probe. This does not rule out support for other post-quantum groups. |
 | `unknown` | The endpoint's key-establishment capability could not be established. |
 
-`certificate_security` is currently always `not_evaluated` because this capability probe neither verifies certificates nor evaluates whether certificate authentication is post-quantum secure.
+`certificate_security` is currently always `not_evaluated` because certificate verification does not determine whether the certificate's authentication algorithm is post-quantum secure.
+
+`certificate_verification.status` is one of:
+
+| Value | Meaning |
+| --- | --- |
+| `not_requested` | Certificate verification was not enabled. |
+| `verified` | Go's standard verifier accepted the certificate chain and target hostname. |
+| `failed` | Standard certificate verification rejected the certificate. Key-establishment results remain independent. |
+| `unavailable` | Verification could not be attempted or the verification handshake failed for a reason other than certificate rejection. |
+
+When verification fails, `hostname_verified` reports whether the leaf certificate matches the target independently of certificate-chain trust when that information is available.
 
 `is_quantum_resistant` is deprecated and retained temporarily for compatibility. It mirrors `supports_x25519_mlkem768`; new integrations should use `supports_x25519_mlkem768`, `key_establishment_security`, and `certificate_security`. No field should be interpreted as a claim that every part of the website is post-quantum secure.
 
@@ -176,6 +202,6 @@ The Python tests use mocked probe results and do not require network access.
 
 ## Security considerations
 
-The Go probe intentionally disables certificate verification because it is testing key-exchange capability rather than endpoint identity. The output therefore reports `certificate_verified` as `null`.
+The key-establishment probes intentionally disable certificate verification because they test capability rather than endpoint identity. With `--verify-certificate`, the checker performs a separate handshake using Go's standard certificate-chain and hostname verification. Certificate failure is reported independently and does not overwrite the key-establishment result.
 
 If this checker is exposed through a web application or API, restrict permitted targets. Allowing arbitrary hostnames, IP addresses, and ports can turn the service into an SSRF or internal-network scanning mechanism.
